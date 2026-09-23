@@ -69,7 +69,11 @@ type Config struct {
 	// ReadTimeoutMS 是单次 Read 的最长等待。收发循环靠"整体时限 + 小步读"推进，
 	// 这个值给小一点（默认 30ms）即可，不需要等于整帧时间。
 	ReadTimeoutMS int
-	// ResponseTimeoutMS 是从站回一帧的上限；为 0 时按波特率与寄存器个数估算。
+	// ResponseTimeoutMS 覆盖"等从站开头的字节送回来"的时限（0 = 自动）。
+	//
+	// 它只管**从站的处理时间**这一段：首字节到了之后，余下字节按字节数另给预算
+	// （见 firstByteTimeout / tailTimeout）。自动值 = 500ms 与 2 倍整帧传输时间中的较大者。
+	// 现场量到设备的实际处理时间后，填它的 2~3 倍即可。
 	ResponseTimeoutMS int
 	// Trace 非空时回调每次收发的十六进制原文，用于现场排障。
 	Trace func(format string, args ...any)
@@ -94,13 +98,23 @@ func (cfg Config) withDefaults() Config {
 	return cfg
 }
 
+// serialPort 是收发需要的最小串口能力：tarm/serial 的 *Port 满足它（测试里用内存替身）。
+//
+// Flush 用来丢弃接收缓冲里残留的字节 —— Windows 上 tarm/serial 把它实现为
+// PurgeComm（含 PURGE_RXCLEAR）。少了这一步，上一轮没收干净的小尾巴会留在缓冲里，
+// 下一轮就从帧中间开始读（见 transact 的说明）。
+type serialPort interface {
+	io.ReadWriteCloser
+	Flush() error
+}
+
 // Client 是一路 Modbus RTU 总线（一个串口）的客户端。
 // 方法自带互斥，可被多个 goroutine 调用；但同一条总线上多从站的报文必须串行发，
 // 因此更稳妥的做法是每个从站一个 worker、各自持有自己的 Client。
 type Client struct {
 	mu        sync.Mutex
 	cfg       Config
-	port      io.ReadWriteCloser
+	port      serialPort
 	lastWrite time.Time
 }
 
@@ -200,6 +214,19 @@ func (c *Client) WriteSingleRegister(slave byte, addr, value uint16) error {
 
 // transact 是唯一的收发出入口：发一帧、收一帧、校验。
 // 全程持锁，保证同一条串口上不会有两帧交叉。
+//
+// 三条"清接收缓冲"的纪律，都是现场日志逼出来的：
+//
+//  1. **发帧前清一次**。上一轮没收干净的小尾巴（超时的半帧、被丢弃的迟到应答）如果留着，
+//     这一轮就会从帧中间开始读。现场日志里那些不像 Modbus 的字节就是残渣被当成帧头：
+//     "应答从站号不符 期望 1 收到 9"（0x09 是制表符）、"无法判定应答长度的功能码 0x20"
+//     （0x20 是空格）—— 协议里都不会出现这两个字节，只可能是错位。
+//  2. **校验不过也要清**。CRC / 从站号 / 功能码不符时，这一帧剩下的部分同样不能留给下一轮，
+//     否则一次坏帧会连累后面好几轮（现场是一错就连着一串）。
+//  3. **超时或发不出去**：关掉串口重开。只有关闭句柄才能取消驱动里那个没回来的重叠读。
+//
+// 为什么晚到的应答也会变成残渣：从站回得比"轮询周期 + 时限"还慢时，它属于上一轮的应答会在
+// 这一轮才进入缓冲。清掉它比收下它更安全 —— 它对应的是已经放弃的那一轮。
 func (c *Client) transact(req []byte, slave, fn byte, count int) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -219,6 +246,7 @@ func (c *Client) transact(req []byte, slave, fn byte, count int) ([]byte, error)
 			time.Sleep(wait)
 		}
 	}
+	c.flushRxLocked() // 纪律 1
 
 	if _, err := c.port.Write(req); err != nil {
 		c.reopenLocked()
@@ -226,48 +254,62 @@ func (c *Client) transact(req []byte, slave, fn byte, count int) ([]byte, error)
 	}
 	c.lastWrite = time.Now()
 
-	deadline := time.Now().Add(c.responseTimeout(count))
-	resp, err := c.readFrame(deadline)
+	resp, err := c.readFrame(count)
 	if err != nil {
-		// 收不到应答往往意味着线序/参数不对或从站掉线，重开一次让下一次干净开始
+		// 收不到应答往往意味着线序/参数不对或从站掉线，重开一次让下一次干净开始（纪律 3）
 		c.reopenLocked()
 		return nil, err
 	}
 	c.trace("RX %s", hex.EncodeToString(resp))
 
-	if resp[0] != slave {
-		return nil, fmt.Errorf("modbus: 应答从站号不符 期望 %d 收到 %d", slave, resp[0])
-	}
-	if resp[1] == fn|fExceptionFlag {
-		if len(resp) < 5 {
-			return nil, fmt.Errorf("modbus: 异常应答过短 %d 字节", len(resp))
-		}
-		return nil, &ExceptionError{Func: fn, Code: resp[2]}
-	}
-	if resp[1] != fn {
-		return nil, fmt.Errorf("modbus: 应答功能码不符 期望 0x%02X 收到 0x%02X", fn, resp[1])
-	}
-	if !validCRC(resp) {
-		return nil, fmt.Errorf("modbus: 应答 CRC 校验失败 % X", resp)
-	}
-	if (fn == FuncReadHolding || fn == FuncReadInput) && len(resp) < 3 {
-		return nil, fmt.Errorf("modbus: 读应答过短 %d 字节", len(resp))
+	if err := checkResponse(resp, slave, fn); err != nil {
+		c.flushRxLocked() // 纪律 2
+		return nil, err
 	}
 	return resp, nil
 }
 
-// readFrame 按功能码应收的长度收一帧。
+// checkResponse 校验一帧应答：长度、CRC、从站号、功能码（含异常应答）。
 //
-// 收不到数据时 tarm/serial 的 Read 在 Windows 上会返回错误，这里靠 err 判断并不方便，
-// 因此沿用仓库里已验证的写法：忽略错误、只看读到的字节数，配合整体时限轮询。
-func (c *Client) readFrame(deadline time.Time) ([]byte, error) {
-	head, err := c.readBytes(2, deadline)
+// **先验 CRC**：帧没通过校验之前，里面的从站号与功能码都不可信 ——
+// 先看从站号的话，CRC 失败的帧会被报成"从站号不符"，排障时会往错的方向查。
+func checkResponse(resp []byte, slave, fn byte) error {
+	// 最短的合法帧是 5 字节：从站 功能码 异常码 CRC CRC
+	if len(resp) < 5 {
+		return fmt.Errorf("modbus: 应答过短 %d 字节 % X", len(resp), resp)
+	}
+	if !validCRC(resp) {
+		return fmt.Errorf("modbus: 应答 CRC 校验失败 % X", resp)
+	}
+	if resp[0] != slave {
+		return fmt.Errorf("modbus: 应答从站号不符 期望 %d 收到 %d", slave, resp[0])
+	}
+	if resp[1] == fn|fExceptionFlag {
+		return &ExceptionError{Func: fn, Code: resp[2]}
+	}
+	if resp[1] != fn {
+		return fmt.Errorf("modbus: 应答功能码不符 期望 0x%02X 收到 0x%02X", fn, resp[1])
+	}
+	return nil
+}
+
+// readFrame 收一帧：先等首字节，再按帧长把余下的字节收完。
+//
+// 时限**拆成两段**是有原因的：整帧共用一个截止时间时，"从站什么时候才开始回"（处理时间，
+// 不可预知）与"回一帧要传多久"（与波特率和字节数有关）挤在同一个预算里。设备处理慢一点
+// （变频器这类 100~200ms 很常见）就会在差最后一两个字节时超时 ——
+// 现场日志里的"等待应答超时（已收 29/30 字节）"就是这么来的：等首字节吃掉了大半预算，
+// 剩下的时间不够传完，于是每次都差一个字节，而那一两个字节留在缓冲里又污染下一轮。
+//
+// 首字节一到，余下的就是纯传输时间，按字节数单独给预算即可（见 tailTimeout）。
+func (c *Client) readFrame(count int) ([]byte, error) {
+	head, err := c.readBytes(2, time.Now().Add(c.firstByteTimeout(count)))
 	if err != nil {
 		return nil, err
 	}
 	// 异常应答：从站 功能码|0x80 异常码 CRC CRC
 	if head[1]&fExceptionFlag != 0 {
-		rest, err := c.readBytes(3, deadline)
+		rest, err := c.readBytes(3, time.Now().Add(c.tailTimeout(3)))
 		if err != nil {
 			return nil, err
 		}
@@ -278,7 +320,7 @@ func (c *Client) readFrame(deadline time.Time) ([]byte, error) {
 	switch head[1] {
 	case FuncReadHolding, FuncReadInput:
 		// 字节数占 1 字节，长度要读到它才知道
-		one, err := c.readBytes(1, deadline)
+		one, err := c.readBytes(1, time.Now().Add(c.tailTimeout(1)))
 		if err != nil {
 			return nil, err
 		}
@@ -290,7 +332,7 @@ func (c *Client) readFrame(deadline time.Time) ([]byte, error) {
 		return nil, fmt.Errorf("modbus: 无法判定应答长度的功能码 0x%02X", head[1])
 	}
 
-	rest, err := c.readBytes(want, deadline)
+	rest, err := c.readBytes(want, time.Now().Add(c.tailTimeout(want)))
 	if err != nil {
 		return nil, err
 	}
@@ -368,17 +410,61 @@ func (c *Client) drainLocked() {
 	}
 }
 
-// responseTimeout 估算"从站处理 + 回一帧"需要多久，再留 3 倍余量。
-// 2400bps 读 25 个寄存器要 ~260ms 才传得完，时限给紧了会误判超时。
-func (c *Client) responseTimeout(count int) time.Duration {
+// flushRxLocked 丢掉接收缓冲里残留的字节（不清发送方向）。
+// 这是"帧对齐"的关键一步：残留的半个帧头会让下一次收发从帧中间开始读。
+//
+// 失败只记 trace、不影响本次收发：清不掉缓冲最坏也就是退化成原来的行为，
+// 不该因此把一次可能成功的读取判死。
+func (c *Client) flushRxLocked() {
+	if c.port == nil {
+		return
+	}
+	if err := c.port.Flush(); err != nil {
+		c.trace("清接收缓冲失败: %v", err)
+	}
+}
+
+// ---- 时限 ------------------------------------------------------------------
+
+// frameDuration 是一帧大约要传多久：报文长度按 5 + 2×寄存器数 估
+// （从站号 + 功能码 + 字节数 + 数据 + CRC），一个字节 10 位，再加 3.5 个字符的帧间静默。
+func frameDuration(baudRate, count int) time.Duration {
+	if baudRate <= 0 {
+		baudRate = 9600
+	}
+	bits := (5+2*count)*10 + frameSilenceBits
+	return time.Duration(bits) * time.Second / time.Duration(baudRate)
+}
+
+// firstByteTimeout 是"发完请求、等从站把开头的字节送回来"的上限。
+//
+// 这一段装的是**从站的处理时间**，而它不可预知（变频器常见 100~200ms，更慢的也有），
+// 所以给得比整帧传输时间宽：取 500ms 与 2 倍整帧时间中的较大者。
+// 现场如果量到了设备的实际处理时间，用 ResponseTimeoutMS 直接覆盖这一段（填处理时间的 2~3 倍）。
+func (c *Client) firstByteTimeout(count int) time.Duration {
 	if c.cfg.ResponseTimeoutMS > 0 {
 		return time.Duration(c.cfg.ResponseTimeoutMS) * time.Millisecond
 	}
-	bytes := 5 + 2*count
-	nanos := int64(bytes*10+frameSilenceBits) * int64(time.Second) / int64(c.cfg.BaudRate)
-	d := time.Duration(nanos) * 3
-	if d < 200*time.Millisecond {
-		d = 200 * time.Millisecond
+	d := 2 * frameDuration(c.cfg.BaudRate, count)
+	if d < 500*time.Millisecond {
+		d = 500 * time.Millisecond
+	}
+	return d
+}
+
+// tailTimeout 是"首字节已到、还要再收 n 个字节"的上限。
+// 这一段是纯传输时间，按字节数给：4 倍余量（USB 转串口有毫秒级的包间隔），下限 60ms。
+func (c *Client) tailTimeout(n int) time.Duration {
+	if n <= 0 {
+		n = 1
+	}
+	baud := c.cfg.BaudRate
+	if baud <= 0 {
+		baud = 9600
+	}
+	d := time.Duration(4*n*10) * time.Second / time.Duration(baud)
+	if d < 60*time.Millisecond {
+		d = 60 * time.Millisecond
 	}
 	return d
 }

@@ -57,7 +57,7 @@ func TestBuildReadRequestMatchesManual(t *testing.T) {
 
 func TestReadHoldingRegistersReturnsValues(t *testing.T) {
 	// 手册应答帧的数据部分：0x1388 / 0x0000 / 0x0000
-	fp := &fakePort{rx: readResponse(1, 0x1388, 0, 0)}
+	fp := &fakePort{resp: readResponse(1, 0x1388, 0, 0)}
 	c := newTestClient(fp)
 	defer c.Close()
 
@@ -81,7 +81,7 @@ func TestReadHoldingRegistersReturnsValues(t *testing.T) {
 
 // 一次只给一个字节，验证按长度收帧的逻辑不依赖串口驱动一次给全。
 func TestReadHoldingRegistersHandlesDribbledBytes(t *testing.T) {
-	fp := &fakePort{rx: readResponse(1, 0x1388, 0, 0), chunk: 1}
+	fp := &fakePort{resp: readResponse(1, 0x1388, 0, 0), chunk: 1}
 	c := newTestClient(fp)
 	defer c.Close()
 
@@ -96,7 +96,7 @@ func TestReadHoldingRegistersHandlesDribbledBytes(t *testing.T) {
 
 func TestReadHoldingRegistersException(t *testing.T) {
 	// 手册的异常应答：功能码 0x83、异常码 4
-	fp := &fakePort{rx: mustHex(t, "018304 40f3")}
+	fp := &fakePort{resp: mustHex(t, "018304 40f3")}
 	c := newTestClient(fp)
 	defer c.Close()
 
@@ -113,7 +113,7 @@ func TestReadHoldingRegistersException(t *testing.T) {
 func TestReadHoldingRegistersRejectsBadCRC(t *testing.T) {
 	frame := readResponse(1, 0x1388, 0, 0)
 	frame[len(frame)-1] ^= 0xFF // 末字节改坏
-	c := newTestClient(&fakePort{rx: frame})
+	c := newTestClient(&fakePort{resp: frame})
 	defer c.Close()
 
 	if _, err := c.ReadHoldingRegisters(1, 0x2100, 3); err == nil {
@@ -133,7 +133,7 @@ func TestReadHoldingRegistersTimeout(t *testing.T) {
 
 func TestReadHoldingRegistersRejectsWrongSlave(t *testing.T) {
 	// 应答里的从站号是 2，我们问的是 1 —— 一条总线上挂多个从站时不能认错
-	fp := &fakePort{rx: readResponse(2, 0x1388)}
+	fp := &fakePort{resp: readResponse(2, 0x1388)}
 	c := newTestClient(fp)
 	defer c.Close()
 
@@ -153,8 +153,69 @@ func TestReadRegistersRejectsBadCount(t *testing.T) {
 	}
 }
 
+// 帧对齐三条纪律的回归测试（现场日志：一次坏帧会连累后面好几轮）。
+//
+// 残渣长什么样：现场出现过"应答从站号不符 期望 1 收到 9"（0x09 制表符）与
+// "无法判定应答长度的功能码 0x20"（0x20 空格）—— 协议里不会有这两个字节，
+// 只能是上一轮没收干净、这一轮从帧中间开始读。这里用同样"不像 Modbus"的字节当残渣。
+func TestStaleBytesAreFlushedBeforeSend(t *testing.T) {
+	fp := &fakePort{
+		preload: mustHex(t, "09201C0000"),      // 上一轮的残渣
+		resp:    readResponse(1, 0x1388, 0, 0), // 这一轮真正的应答（发帧之后才到）
+	}
+	c := newTestClient(fp)
+	defer c.Close()
+
+	got, err := c.ReadHoldingRegisters(1, 0x2100, 3)
+	if err != nil {
+		t.Fatalf("残留字节没清掉，收帧从帧中间开始了: %v", err)
+	}
+	if len(got) != 3 || got[0] != 0x1388 {
+		t.Fatalf("寄存器内容不对 % X", got)
+	}
+	if fp.flushCount() == 0 {
+		t.Fatal("发帧前没有清接收缓冲")
+	}
+}
+
+func TestBadFrameFlushesBuffer(t *testing.T) {
+	frame := readResponse(1, 0x1388, 0, 0)
+	frame[len(frame)-1] ^= 0xFF // CRC 改坏
+	fp := &fakePort{resp: frame}
+	c := newTestClient(fp)
+	defer c.Close()
+
+	if _, err := c.ReadHoldingRegisters(1, 0x2100, 3); err == nil {
+		t.Fatal("CRC 错误却读成功了")
+	}
+	if n := fp.flushCount(); n < 2 {
+		t.Fatalf("坏帧之后没有清缓冲：flush 次数 %d，期望 ≥2（发帧前一次 + 坏帧后一次）", n)
+	}
+}
+
+// 从站回得慢（超过旧实现那 200ms 的整帧预算）：首字节的时限要等得住，
+// 首字节到了之后余下字节另给预算 —— 否则就是现场那种"已收 29/30 字节"的超时。
+func TestSlowDeviceStillReceives(t *testing.T) {
+	fp := &fakePort{
+		resp:  readResponse(1, 0x1388, 0, 0),
+		delay: 300 * time.Millisecond, // 设备处理 300ms 才开始回
+	}
+	// ResponseTimeoutMS 留 0：走自动值（500ms 下限），这一段包含设备处理时间
+	c := New(Config{PortName: "COM_TEST", BaudRate: 9600, ReadTimeoutMS: 1, Trace: func(string, ...any) {}})
+	c.port = fp
+	defer c.Close()
+
+	got, err := c.ReadHoldingRegisters(1, 0x2100, 3)
+	if err != nil {
+		t.Fatalf("设备回得慢一读就超时: %v", err)
+	}
+	if len(got) != 3 || got[0] != 0x1388 {
+		t.Fatalf("寄存器内容不对 % X", got)
+	}
+}
+
 func TestWriteSingleRegisterEcho(t *testing.T) {
-	fp := &fakePort{rx: appendCRC([]byte{0x01, 0x06, 0x21, 0x00, 0x00, 0x64})}
+	fp := &fakePort{resp: appendCRC([]byte{0x01, 0x06, 0x21, 0x00, 0x00, 0x64})}
 	c := newTestClient(fp)
 	defer c.Close()
 
@@ -203,17 +264,32 @@ func readResponse(slave byte, regs ...uint16) []byte {
 }
 
 // fakePort 是内存里的串口：Write 记下来，Read 按 chunk 一片片吐出预置应答。
+//
+//	preload —— 构造时就"已经在缓冲里"的字节（模拟上一轮没收干净的残渣）。
+//	resp    —— 发帧之后才到达的字节（正常的从站应答都走这里：真串口上应答不可能
+//	              早于请求，而"发帧前清缓冲"正是要清掉 preload、留下 resp）。
+//	delay   —— 从站的处理时间：Write 之后这么久内 Read 一律返回 0 字节。
 type fakePort struct {
-	mu     sync.Mutex
-	rx     []byte
-	offset int
-	chunk  int // 0 表示一次给完
-	writes []byte
+	mu      sync.Mutex
+	rx      []byte
+	offset  int
+	chunk   int // 0 表示一次给完
+	preload []byte
+	resp    []byte
+	delay   time.Duration
+	writeAt time.Time
+	flushes int
+	writes  []byte
 }
 
 func (f *fakePort) Read(p []byte) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// 从站还在处理：还没开始回话
+	if f.delay > 0 && !f.writeAt.IsZero() && time.Since(f.writeAt) < f.delay {
+		time.Sleep(time.Millisecond)
+		return 0, nil
+	}
 	if f.offset >= len(f.rx) {
 		// 没有数据了：真串口这里是等超时，返回 0 字节即可
 		time.Sleep(time.Millisecond)
@@ -235,7 +311,24 @@ func (f *fakePort) Write(p []byte) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.writes = append(f.writes, p...)
+	if f.writeAt.IsZero() {
+		f.writeAt = time.Now()
+	}
+	if f.resp != nil {
+		f.rx = append(f.rx, f.resp...)
+		f.resp = nil
+	}
 	return len(p), nil
+}
+
+// Flush 丢掉还没读走的字节，与真串口上的 PURGE_RXCLEAR 一致。
+func (f *fakePort) Flush() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.flushes++
+	f.rx = f.rx[:0]
+	f.offset = 0
+	return nil
 }
 
 func (f *fakePort) Close() error { return nil }
@@ -244,6 +337,12 @@ func (f *fakePort) sent() []byte {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]byte(nil), f.writes...)
+}
+
+func (f *fakePort) flushCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.flushes
 }
 
 func mustHex(t *testing.T, s string) []byte {
