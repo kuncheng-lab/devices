@@ -153,11 +153,29 @@ func TestReadRegistersRejectsBadCount(t *testing.T) {
 	}
 }
 
-// 帧对齐三条纪律的回归测试（现场日志：一次坏帧会连累后面好几轮）。
+// 应答的字节数必须与请求的寄存器个数一致。
+//
+// 迟到的、或同一条总线上别的一笔的应答也有合法 CRC、站号与功能码也照样对得上，
+// 长度是唯一能把它们区分开的东西 —— 照收的话上层会按错误的长度取下标
+// （读 2 个却回 14 个，就会把监控组的数据当成状态区）。
+func TestResponseLengthMustMatchRequest(t *testing.T) {
+	// 问的是 2 个寄存器，回的却是 3 个（CRC、从站号、功能码都合法）
+	fp := &fakePort{resp: readResponse(1, 0x2345, 0x1388, 0)}
+	c := newTestClient(fp)
+	defer c.Close()
+
+	if _, err := c.ReadHoldingRegisters(1, 0x2002, 2); err == nil {
+		t.Fatal("应答字节数与请求不符却读成功了")
+	}
+}
+
+// 帧对齐与重试的回归测试（现场日志：一次坏帧会连累后面好几轮）。
 //
 // 残渣长什么样：现场出现过"应答从站号不符 期望 1 收到 9"（0x09 制表符）与
 // "无法判定应答长度的功能码 0x20"（0x20 空格）—— 协议里不会有这两个字节，
 // 只能是上一轮没收干净、这一轮从帧中间开始读。这里用同样"不像 Modbus"的字节当残渣。
+//
+// 现在对付残渣的只有一条纪律（每次发帧前清一次）加一条兜底（重试），两条都在这里钉住。
 func TestStaleBytesAreFlushedBeforeSend(t *testing.T) {
 	fp := &fakePort{
 		preload: mustHex(t, "09201C0000"),      // 上一轮的残渣
@@ -178,30 +196,59 @@ func TestStaleBytesAreFlushedBeforeSend(t *testing.T) {
 	}
 }
 
-func TestBadFrameFlushesBuffer(t *testing.T) {
-	frame := readResponse(1, 0x1388, 0, 0)
-	frame[len(frame)-1] ^= 0xFF // CRC 改坏
-	fp := &fakePort{resp: frame}
+// 重试：第一帧被改坏、第二帧正常，一次事务里应当救回来 ——
+// 现场的偶发毛刺就是靠它被吸收掉的，而不是丢掉这一拍采样。
+func TestRetryAfterBadFrame(t *testing.T) {
+	bad := readResponse(1, 0x1388, 0, 0)
+	bad[len(bad)-1] ^= 0xFF // CRC 改坏
+	fp := &fakePort{queue: [][]byte{bad, readResponse(1, 0x1388, 0, 0)}}
 	c := newTestClient(fp)
+	c.cfg.Retries = 1
 	defer c.Close()
 
-	if _, err := c.ReadHoldingRegisters(1, 0x2100, 3); err == nil {
-		t.Fatal("CRC 错误却读成功了")
+	got, err := c.ReadHoldingRegisters(1, 0x2100, 3)
+	if err != nil {
+		t.Fatalf("重试没救回来: %v", err)
 	}
-	if n := fp.flushCount(); n < 2 {
-		t.Fatalf("坏帧之后没有清缓冲：flush 次数 %d，期望 ≥2（发帧前一次 + 坏帧后一次）", n)
+	if len(got) != 3 || got[0] != 0x1388 {
+		t.Fatalf("寄存器内容不对 % X", got)
+	}
+	// 两次尝试 = 两帧请求（每个请求 8 字节）+ 发帧前各清一次接收缓冲。
+	// 第二次清缓冲是重试能成功的前提：残渣会跟着毁掉每一次重试。
+	if n := len(fp.sent()); n != 16 {
+		t.Fatalf("发了 %d 字节，期望两帧共 16 字节", n)
+	}
+	if n := fp.flushCount(); n != 2 {
+		t.Fatalf("清缓冲 %d 次，期望每帧前各一次（2 次）", n)
 	}
 }
 
-// 从站回得慢（超过旧实现那 200ms 的整帧预算）：首字节的时限要等得住，
-// 首字节到了之后余下字节另给预算 —— 否则就是现场那种"已收 29/30 字节"的超时。
+// 重试用完就放弃：Retries=1 ⇒ 一共发两帧，错误原样交给上层（由上层决定要不要重连）。
+func TestRetriesGiveUpAfterLimit(t *testing.T) {
+	bad := readResponse(1, 0x1388, 0, 0)
+	bad[len(bad)-1] ^= 0xFF // CRC 改坏
+	fp := &fakePort{queue: [][]byte{bad, bad}}
+	c := newTestClient(fp)
+	c.cfg.Retries = 1
+	defer c.Close()
+
+	if _, err := c.ReadHoldingRegisters(1, 0x2100, 3); err == nil {
+		t.Fatal("两帧都坏却读成功了")
+	}
+	if n := len(fp.sent()); n != 16 {
+		t.Fatalf("发了 %d 字节，期望 Retries=1 时正好两帧（16 字节）", n)
+	}
+}
+
+// 从站回得慢：整帧时限要等得住从站的处理时间。现场那种"已收 29/30 字节"的超时，
+// 根子就是等首字节时把整帧预算耗光了。
 func TestSlowDeviceStillReceives(t *testing.T) {
 	fp := &fakePort{
 		resp:  readResponse(1, 0x1388, 0, 0),
 		delay: 300 * time.Millisecond, // 设备处理 300ms 才开始回
 	}
-	// ResponseTimeoutMS 留 0：走自动值（500ms 下限），这一段包含设备处理时间
-	c := New(Config{PortName: "COM_TEST", BaudRate: 9600, ReadTimeoutMS: 1, Trace: func(string, ...any) {}})
+	// ResponseTimeoutMS 留 0：走自动值（500ms 下限），它包含设备处理时间
+	c := New(Config{PortName: "COM_TEST", BaudRate: 9600, Trace: func(string, ...any) {}})
 	c.port = fp
 	defer c.Close()
 
@@ -243,11 +290,12 @@ func TestUnconfiguredPortNameIsRejected(t *testing.T) {
 // ---- 测试替身与夹具 --------------------------------------------------------
 
 func newTestClient(port *fakePort) *Client {
+	// 时限只要够假串口把预置的字节吐完即可，测试里不真等。
+	// Retries 留 0（只发一次）：需要重试的用例自己设，别的用例靠它把"发了几帧"数得清楚。
 	c := New(Config{
 		PortName:          "COM_TEST",
 		BaudRate:          9600,
 		ResponseTimeoutMS: 60,
-		ReadTimeoutMS:     1,
 		Trace:             func(string, ...any) {},
 	})
 	c.port = port // 绕过真实串口
@@ -268,6 +316,8 @@ func readResponse(slave byte, regs ...uint16) []byte {
 //	preload —— 构造时就"已经在缓冲里"的字节（模拟上一轮没收干净的残渣）。
 //	resp    —— 发帧之后才到达的字节（正常的从站应答都走这里：真串口上应答不可能
 //	              早于请求，而"发帧前清缓冲"正是要清掉 preload、留下 resp）。
+//	queue   —— 与 resp 同理，但每次 Write 依次取一条：用来喂"第一次坏、第二次好"
+//	              这种多帧序列（没有 queue 时 resp 发完第一次就成了空）。
 //	delay   —— 从站的处理时间：Write 之后这么久内 Read 一律返回 0 字节。
 type fakePort struct {
 	mu      sync.Mutex
@@ -276,6 +326,7 @@ type fakePort struct {
 	chunk   int // 0 表示一次给完
 	preload []byte
 	resp    []byte
+	queue   [][]byte
 	delay   time.Duration
 	writeAt time.Time
 	flushes int
@@ -314,7 +365,11 @@ func (f *fakePort) Write(p []byte) (int, error) {
 	if f.writeAt.IsZero() {
 		f.writeAt = time.Now()
 	}
-	if f.resp != nil {
+	switch {
+	case len(f.queue) > 0:
+		f.rx = append(f.rx, f.queue[0]...)
+		f.queue = f.queue[1:]
+	case f.resp != nil:
 		f.rx = append(f.rx, f.resp...)
 		f.resp = nil
 	}
